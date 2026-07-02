@@ -63,3 +63,4 @@ android/key.properties
 # build outputs / release artifacts
 dist/
 *.apk
+/apk

@@ -1,7 +1,6 @@
 // Local raw-first storage (SQLite via sqflite).
 //
 // Durable storage layers:
-//   raw_records   — the band's bytes verbatim, keyed by counter. Replay/debug ledger.
 //   decoded_onehz — canonical per-second decoded substrate, deduped by rec_ts.
 //   decoded_rr    — sparse RR beats for that substrate, deduped by (rr_ts_ms, beat_index).
 //   samples       — legacy header cache kept only for backward-compat fallback.
@@ -44,7 +43,6 @@ class LocalDb {
     return openDatabase(
       path,
       onCreate: (db, version) async {
-        await _createRaw(db);
         await _createSamples(db);
         await _createDecodedStore(db);
         await db.execute('CREATE INDEX idx_samples_ts ON samples(ts)');
@@ -199,11 +197,16 @@ class LocalDb {
           // `date` PK is a period-start marker) so a date can carry both.
           await _createCycleSymptom(db);
         }
+        if (oldV < 19) {
+          await _createDecodedStore(db);
+          await _backfillDecodedStore(db);
+          await _dropRawStore(db);
+        }
       },
       onOpen: (db) async {
         await _repairOpenSchema(db);
       },
-      version: 18,
+      version: 19,
     );
   }
 
@@ -227,9 +230,9 @@ class LocalDb {
     await _createDecodedStore(db);
     await _createLiveCoverage(db);
     await _createCycleSymptom(db);
-    await _ensureRawRecordSchema(db);
     await _ensureSessionSchema(db);
     await _ensureSyncStateSchema(db);
+    await _dropRawStore(db);
   }
 
   // ── MENSTRUAL SYMPTOM LOG ──────────────────────────────────────────────────
@@ -424,14 +427,6 @@ class LocalDb {
       for (var i = 0; i < raws.length; i++) {
         final raw = raws[i];
         final recTs = _recTsFor(raw);
-        batch.insert('raw_records', {
-          'hex': raw.hex,
-          'packet_type': raw.packetType,
-          'counter': raw.counter,
-          'captured_at': raw.capturedAt,
-          'rec_ts': recTs,
-          'uploaded': raw.uploaded ? 1 : 0,
-        }, conflictAlgorithm: ConflictAlgorithm.ignore);
         final sample = samples[i];
         if (sample != null) {
           batch.insert('samples', {
@@ -666,19 +661,8 @@ class LocalDb {
     await _ensureSyncQuarantineSchema(db);
   }
 
-  static Future<void> _ensureRawRecordSchema(Database db) async {
-    final cols = await db.rawQuery("PRAGMA table_info(raw_records)");
-    final names = {
-      for (final c in cols)
-        if (c['name'] is String) c['name'] as String,
-    };
-    if (!names.contains('rec_ts')) {
-      await _addRecTsColumn(db);
-      await _backfillRecTs(db);
-      await db.execute(
-        'CREATE INDEX IF NOT EXISTS idx_raw_rects ON raw_records(rec_ts)',
-      );
-    }
+  static Future<void> _dropRawStore(Database db) async {
+    await db.execute('DROP TABLE IF EXISTS raw_records');
   }
 
   static Future<void> _ensureSessionSchema(Database db) async {
@@ -1322,21 +1306,14 @@ class LocalDb {
 
   static Future<bool> insertRecord(RawRecord raw, Sample? sample) async {
     final db = await instance;
-    int rawRows = 0;
+    var inserted = false;
     await db.transaction((txn) async {
       final batch = txn.batch();
-      rawRows = await txn.insert('raw_records', {
-        'hex': raw.hex,
-        'packet_type': raw.packetType,
-        'counter': raw.counter,
-        'captured_at': raw.capturedAt,
-        'rec_ts': _recTsFor(raw),
-        'uploaded': raw.uploaded ? 1 : 0,
-      }, conflictAlgorithm: ConflictAlgorithm.ignore);
       _queueDecodedOneHz(batch, raw, sample);
       await batch.commit(noResult: true);
+      inserted = true;
     });
-    return rawRows != 0;
+    return inserted;
   }
 
   /// Insert many records in ONE transaction. During a historical drain this is
@@ -1354,14 +1331,6 @@ class LocalDb {
       final batch = txn.batch();
       for (var i = 0; i < raws.length; i++) {
         final raw = raws[i];
-        batch.insert('raw_records', {
-          'hex': raw.hex,
-          'packet_type': raw.packetType,
-          'counter': raw.counter,
-          'captured_at': raw.capturedAt,
-          'rec_ts': _recTsFor(raw),
-          'uploaded': raw.uploaded ? 1 : 0,
-        }, conflictAlgorithm: ConflictAlgorithm.ignore);
         final sample = samples[i];
         _queueDecodedOneHz(batch, raw, sample);
       }
@@ -1450,41 +1419,6 @@ class LocalDb {
     });
   }
 
-  static Future<List<RawRecord>> unuploadedRaw({int limit = 500}) async {
-    final db = await instance;
-    final rows = await db.query(
-      'raw_records',
-      where: 'uploaded = 0',
-      orderBy: 'captured_at ASC',
-      limit: limit,
-    );
-    return rows
-        .map(
-          (m) => RawRecord(
-            counter: (m['counter'] as int?) ?? 0,
-            packetType: (m['packet_type'] as int?) ?? 0,
-            hex: m['hex'] as String,
-            capturedAt: m['captured_at'] as int,
-            recTs: (m['rec_ts'] as int?),
-            uploaded: false,
-          ),
-        )
-        .toList();
-  }
-
-  /// Once a batch is safely on the server, DELETE the raw blobs locally — we
-  /// don't need on-device history (the cloud is the system of record). Keeps the
-  /// device storage tiny: raw_records only ever holds the not-yet-uploaded queue.
-  static Future<void> markUploaded(List<String> hexes) async {
-    if (hexes.isEmpty) return;
-    final db = await instance;
-    final placeholders = List.filled(hexes.length, '?').join(',');
-    await db.rawDelete(
-      'DELETE FROM raw_records WHERE hex IN ($placeholders)',
-      hexes,
-    );
-  }
-
   static Future<List<Sample>> samplesInRange(int fromTs, int toTs) async {
     final db = await instance;
     final decodedRows = await db.query(
@@ -1536,60 +1470,31 @@ class LocalDb {
 
   static Future<Map<String, int>> counts() async {
     final db = await instance;
-    final raw =
+    final oneHz =
         Sqflite.firstIntValue(
-          await db.rawQuery('SELECT COUNT(*) FROM raw_records'),
+          await db.rawQuery('SELECT COUNT(*) FROM decoded_onehz'),
         ) ??
         0;
-    final pending =
+    final rr =
         Sqflite.firstIntValue(
-          await db.rawQuery(
-            'SELECT COUNT(*) FROM raw_records WHERE uploaded = 0',
-          ),
+          await db.rawQuery('SELECT COUNT(*) FROM decoded_rr'),
         ) ??
         0;
-    return {'raw': raw, 'pending': pending};
+    return {
+      'raw': oneHz,
+      'pending': 0,
+      'decoded_onehz': oneHz,
+      'decoded_rr': rr,
+    };
   }
 
-  // ── raw read (for the DerivationEngine — main isolate only) ─────────────────
-
-  /// All raw record hexes captured in [fromMs, toMs] (epoch ms = captured_at),
-  /// oldest first. The engine decodes these via openstrap_protocol off-isolate.
-  static Future<List<String>> rawHexInCaptureRange(int fromMs, int toMs) async {
-    final db = await instance;
-    final rows = await db.query(
-      'raw_records',
-      columns: ['hex'],
-      where: 'captured_at >= ? AND captured_at <= ?',
-      whereArgs: [fromMs, toMs],
-      orderBy: 'captured_at ASC',
-    );
-    return rows.map((m) => m['hex'] as String).toList();
-  }
-
-  /// All raw record hexes whose REAL record time (`rec_ts`, epoch SECONDS) is in
-  /// [fromSec, toSec], oldest first. This is the day-window read the engine uses so
-  /// a backfill is split by real day, not by when it was received (captured_at).
-  static Future<List<String>> rawHexInRecTsRange(int fromSec, int toSec) async {
-    final db = await instance;
-    final rows = await db.query(
-      'raw_records',
-      columns: ['hex'],
-      where: 'rec_ts >= ? AND rec_ts <= ?',
-      whereArgs: [fromSec, toSec],
-      orderBy: 'rec_ts ASC',
-    );
-    return rows.map((m) => m['hex'] as String).toList();
-  }
-
-  /// `{localDayLabel -> MAX(rec_ts)}` over all raw, grouped by the LOCAL calendar
-  /// day of the record's real time. The engine compares each day's max rec_ts
-  /// against its derived cursor to decide what needs (re)derivation.
-  static Future<Map<String, int>> rawRecTsMaxByDay() async {
+  /// `{localDayLabel -> MAX(rec_ts)}` over canonical decoded 1 Hz rows, grouped
+  /// by the LOCAL calendar day of the record's real time.
+  static Future<Map<String, int>> decodedRecTsMaxByDay() async {
     final db = await instance;
     final rows = await db.rawQuery(
       "SELECT strftime('%Y-%m-%d', rec_ts, 'unixepoch', 'localtime') AS d, "
-      'MAX(rec_ts) AS mx FROM raw_records GROUP BY d',
+      'MAX(rec_ts) AS mx FROM decoded_onehz GROUP BY d',
     );
     final out = <String, int>{};
     for (final r in rows) {
@@ -1598,86 +1503,6 @@ class LocalDb {
       if (d != null && mx != null) out[d] = mx;
     }
     return out;
-  }
-
-  /// The newest `captured_at` (epoch ms) across all raw — used to find days with
-  /// new raw to (re)derive. Null if the store is empty.
-  static Future<int?> latestRawCapturedAt() async {
-    final db = await instance;
-    return Sqflite.firstIntValue(
-      await db.rawQuery('SELECT MAX(captured_at) FROM raw_records'),
-    );
-  }
-
-  /// The oldest `captured_at` (epoch ms) across all raw. Null if empty.
-  static Future<int?> earliestRawCapturedAt() async {
-    final db = await instance;
-    return Sqflite.firstIntValue(
-      await db.rawQuery('SELECT MIN(captured_at) FROM raw_records'),
-    );
-  }
-
-  /// ALL retained raw record hexes, ordered by REAL record time (rec_ts). The
-  /// engine decodes these ONCE into a single continuous Substrate (substrate.dart).
-  static Future<List<String>> allRawHexByRecTs() async {
-    final db = await instance;
-    final rows = await db.query(
-      'raw_records',
-      columns: ['hex'],
-      orderBy: 'rec_ts ASC',
-    );
-    return rows.map((m) => m['hex'] as String).toList();
-  }
-
-  /// Cursor for batched decode. Used by the derivation coordinator so the raw
-  /// ledger never has to cross sqflite as one huge result set.
-  static Future<List<Map<String, dynamic>>> rawHexBatchByRecTs({
-    required int limit,
-    int? afterRecTs,
-    int? afterRowId,
-  }) async {
-    final db = await instance;
-    if (afterRecTs == null || afterRowId == null) {
-      return db.rawQuery(
-        'SELECT rowid, hex, rec_ts FROM raw_records '
-        'ORDER BY rec_ts ASC, rowid ASC LIMIT ?',
-        [limit],
-      );
-    }
-    return db.rawQuery(
-      'SELECT rowid, hex, rec_ts FROM raw_records '
-      'WHERE rec_ts > ? OR (rec_ts = ? AND rowid > ?) '
-      'ORDER BY rec_ts ASC, rowid ASC LIMIT ?',
-      [afterRecTs, afterRecTs, afterRowId, limit],
-    );
-  }
-
-  /// Cursor for batched decode scoped to a REAL record-time window. Used by the
-  /// derive coordinator so a light/heavy pass can rebuild only the affected raw
-  /// horizon rather than the full retained ledger.
-  static Future<List<Map<String, dynamic>>> rawHexBatchByRecTsRange({
-    required int limit,
-    required int fromRecTs,
-    required int toRecTs,
-    int? afterRecTs,
-    int? afterRowId,
-  }) async {
-    final db = await instance;
-    if (afterRecTs == null || afterRowId == null) {
-      return db.rawQuery(
-        'SELECT rowid, hex, rec_ts FROM raw_records '
-        'WHERE rec_ts >= ? AND rec_ts <= ? '
-        'ORDER BY rec_ts ASC, rowid ASC LIMIT ?',
-        [fromRecTs, toRecTs, limit],
-      );
-    }
-    return db.rawQuery(
-      'SELECT rowid, hex, rec_ts FROM raw_records '
-      'WHERE rec_ts >= ? AND rec_ts <= ? '
-      'AND (rec_ts > ? OR (rec_ts = ? AND rowid > ?)) '
-      'ORDER BY rec_ts ASC, rowid ASC LIMIT ?',
-      [fromRecTs, toRecTs, afterRecTs, afterRecTs, afterRowId, limit],
-    );
   }
 
   /// Decoded 1 Hz frames in record-time order. This is the preferred derive
@@ -1865,7 +1690,7 @@ class LocalDb {
       'COUNT(*) AS raw_count, '
       'MIN(rec_ts) AS min_rec_ts, '
       'MAX(rec_ts) AS max_rec_ts '
-      'FROM raw_records WHERE rec_ts > 0 GROUP BY day_id ORDER BY day_id DESC',
+      'FROM decoded_onehz WHERE rec_ts > 0 GROUP BY day_id ORDER BY day_id DESC',
     );
     final derivedRows = await db.rawQuery(
       'SELECT r.day_id, r.algo_version, r.computed_at, r.finalized '
@@ -1951,7 +1776,6 @@ class LocalDb {
     final out = await openDatabase(
       dest,
       onCreate: (db, _) async {
-        await _createRaw(db);
         await _createSamples(db);
         await _createDecodedStore(db);
         await db.execute('CREATE INDEX idx_samples_ts ON samples(ts)');
@@ -1989,11 +1813,6 @@ class LocalDb {
     }
 
     Future<void> copyRawRange(int startSec, int endSec) async {
-      await copyRows(
-        'raw_records',
-        where: 'rec_ts >= ? AND rec_ts < ?',
-        whereArgs: [startSec, endSec],
-      );
       final decoded = await src.query(
         'decoded_onehz',
         where: 'rec_ts >= ? AND rec_ts < ?',
@@ -2115,11 +1934,6 @@ class LocalDb {
         final startSec = _localDayStartSec(dayId);
         final endSec = startSec + _daySec;
         deleted += await txn.delete(
-          'raw_records',
-          where: 'rec_ts >= ? AND rec_ts < ?',
-          whereArgs: [startSec, endSec],
-        );
-        deleted += await txn.delete(
           'decoded_rr',
           where:
               'counter IN (SELECT counter FROM decoded_onehz WHERE rec_ts >= ? AND rec_ts < ?)',
@@ -2185,9 +1999,12 @@ class LocalDb {
     final db = await instance;
     // Order: independent tables; all use INSERT OR REPLACE so re-import is safe.
     const tables = [
-      'raw_records',
       'samples',
       'events',
+      'decoded_onehz',
+      'decoded_rr',
+      'band_events',
+      'band_battery',
       'day_result',
       'metric_series',
       'sessions',
@@ -2250,22 +2067,12 @@ class LocalDb {
     final db = await instance;
     final count =
         Sqflite.firstIntValue(
-          await db.rawQuery('SELECT COUNT(*) FROM raw_records'),
+          await db.rawQuery('SELECT COUNT(*) FROM decoded_onehz'),
         ) ??
         0;
     final tsRow = (await db.rawQuery(
-      'SELECT MIN(rec_ts) AS lo, MAX(rec_ts) AS hi FROM raw_records WHERE rec_ts > 0',
+      'SELECT MIN(rec_ts) AS lo, MAX(rec_ts) AS hi FROM decoded_onehz WHERE rec_ts > 0',
     )).first;
-    final capRow = (await db.rawQuery(
-      'SELECT MIN(captured_at) AS lo, MAX(captured_at) AS hi FROM raw_records',
-    )).first;
-    final typeRows = await db.rawQuery(
-      'SELECT packet_type AS t, COUNT(*) AS n FROM raw_records GROUP BY packet_type',
-    );
-    final byType = <String, int>{};
-    for (final r in typeRows) {
-      byType['${(r['t'] as int?) ?? -1}'] = (r['n'] as int?) ?? 0;
-    }
     final decodedOneHz =
         Sqflite.firstIntValue(
           await db.rawQuery('SELECT COUNT(*) FROM decoded_onehz'),
@@ -2285,13 +2092,93 @@ class LocalDb {
       'count': count,
       'min_rec_ts': (tsRow['lo'] as num?)?.toInt(),
       'max_rec_ts': (tsRow['hi'] as num?)?.toInt(),
-      'by_type': byType,
-      'min_captured_ms': (capRow['lo'] as num?)?.toInt(),
-      'max_captured_ms': (capRow['hi'] as num?)?.toInt(),
+      'by_type': const <String, int>{},
+      'min_captured_ms': null,
+      'max_captured_ms': null,
       'decoded_onehz': decodedOneHz,
       'decoded_rr': decodedRr,
       'legacy_samples': legacySamples,
     };
+  }
+
+  static Future<List<Map<String, dynamic>>> tableStorageStats() async {
+    final db = await instance;
+    final rows = await db.rawQuery(
+      "SELECT name FROM sqlite_master "
+      "WHERE type = 'table' "
+      "AND name NOT LIKE 'sqlite_%' "
+      "AND name != 'android_metadata' "
+      "ORDER BY name ASC",
+    );
+    final out = <Map<String, dynamic>>[];
+    final dbstatAvailable = await _dbstatAvailable(db);
+    for (final row in rows) {
+      final name = row['name']?.toString();
+      if (name == null || name.isEmpty) continue;
+      final tableRows =
+          Sqflite.firstIntValue(
+            await db.rawQuery('SELECT COUNT(*) FROM $name'),
+          ) ??
+          0;
+      final bytes = dbstatAvailable
+          ? await _tableBytesViaDbstat(db, name)
+          : await _tableBytesApprox(db, name);
+      out.add({
+        'table': name,
+        'rows': tableRows,
+        'bytes': bytes,
+        'mb': bytes == null ? null : bytes / (1024 * 1024),
+        'approximate': !dbstatAvailable,
+      });
+    }
+    out.sort((a, b) {
+      final aa = (a['bytes'] as num?)?.toInt() ?? -1;
+      final bb = (b['bytes'] as num?)?.toInt() ?? -1;
+      return bb.compareTo(aa);
+    });
+    return out;
+  }
+
+  static Future<bool> _dbstatAvailable(Database db) async {
+    try {
+      await db.rawQuery(
+        "SELECT SUM(pgsize) AS bytes FROM dbstat WHERE name = 'decoded_onehz'",
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<int?> _tableBytesViaDbstat(Database db, String table) async {
+    try {
+      final row = (await db.rawQuery(
+        'SELECT SUM(pgsize) AS bytes FROM dbstat WHERE name = ?',
+        [table],
+      )).first;
+      return (row['bytes'] as num?)?.toInt() ?? 0;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static Future<int?> _tableBytesApprox(Database db, String table) async {
+    try {
+      final cols = await db.rawQuery('PRAGMA table_info($table)');
+      if (cols.isEmpty) return 0;
+      final expr = cols
+          .map((c) {
+            final name = c['name']?.toString() ?? '';
+            return 'IFNULL(LENGTH($name), 0)';
+          })
+          .join(' + ');
+      final row = (await db.rawQuery(
+        'SELECT SUM($expr) AS bytes FROM $table',
+      )).first;
+      return (row['bytes'] as num?)?.toInt() ?? 0;
+    } catch (_) {
+      return null;
+    }
   }
 
   static Future<Map<String, dynamic>> schemaHealth() async {
@@ -2313,7 +2200,6 @@ class LocalDb {
     }
 
     final requiredTables = <String>[
-      'raw_records',
       'samples',
       'decoded_onehz',
       'decoded_rr',
@@ -2342,9 +2228,6 @@ class LocalDb {
       if (!await hasTable(table)) missingTables.add(table);
     }
 
-    final rawCols = await hasTable('raw_records')
-        ? await cols('raw_records')
-        : <String>{};
     final sessionCols = await hasTable('sessions')
         ? await cols('sessions')
         : <String>{};
@@ -2361,7 +2244,6 @@ class LocalDb {
       if (miss.isNotEmpty) missingColumns[table] = miss;
     }
 
-    expect('raw_records', rawCols, ['counter', 'hex', 'captured_at', 'rec_ts']);
     expect('sessions', sessionCols, ['id', 'start_ts', 'status', 'steps']);
     expect('sync_ledger', syncLedgerCols, [
       'chunk_id',
@@ -2440,7 +2322,7 @@ class LocalDb {
     int limit,
   ) async {
     final rows = await recentDayResults(limit);
-    final rawByDay = await rawRecTsMaxByDay();
+    final rawByDay = await decodedRecTsMaxByDay();
     final out = <Map<String, dynamic>>[];
     for (final row in rows) {
       final payload = row['payload_json'] as String?;
@@ -3026,24 +2908,14 @@ class LocalDb {
         0;
   }
 
-  // ── raw pruning (raw-first invariant) ───────────────────────────────────────
+  // ── decoded retention ───────────────────────────────────────────────────────
 
-  /// Delete raw_records / decoded substrate / structured band signals / events whose RECORD TIME (epoch
-  /// seconds) is
-  /// strictly before [cutoffSec]. Keyed on record time (`rec_ts`/`ts`), NOT
-  /// receive time (`captured_at`): retention tracks the DATA, so a multi-day
-  /// flash backfill drained in a single sync is never pruned merely for having
-  /// just landed. The caller only prunes windows that are FULLY DERIVED — never
-  /// prune raw for a day that hasn't been derived yet. Returns rows deleted.
-  static Future<int> pruneRawBeforeRecTs(int cutoffSec) async {
+  /// Delete decoded substrate / structured band signals / events whose RECORD
+  /// TIME (epoch seconds) is strictly before [cutoffSec].
+  static Future<int> pruneDecodedBeforeRecTs(int cutoffSec) async {
     final db = await instance;
     int deleted = 0;
     await db.transaction((txn) async {
-      deleted = await txn.delete(
-        'raw_records',
-        where: 'rec_ts < ?',
-        whereArgs: [cutoffSec],
-      );
       await txn.delete(
         'decoded_rr',
         where:
@@ -3063,14 +2935,14 @@ class LocalDb {
     return deleted;
   }
 
-  /// The DATA EDGE — the timestamp (epoch seconds) of the last record we've
-  /// actually drained. This, not the wall clock, is "the latest data we have":
-  /// the band buffers in flash and drains on sync, so this can lag wall-clock
-  /// time by hours/days. Null when there's no raw yet.
-  static Future<int?> lastRawRecTs() async {
+  /// The DATA EDGE — the timestamp (epoch seconds) of the last canonical 1 Hz
+  /// record we've durably stored.
+  static Future<int?> lastDecodedRecTs() async {
     final db = await instance;
     return Sqflite.firstIntValue(
-      await db.rawQuery('SELECT MAX(rec_ts) FROM raw_records WHERE rec_ts > 0'),
+      await db.rawQuery(
+        'SELECT MAX(rec_ts) FROM decoded_onehz WHERE rec_ts > 0',
+      ),
     );
   }
 }

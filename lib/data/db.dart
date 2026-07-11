@@ -1,13 +1,14 @@
-// Local raw-first storage (SQLite via sqflite).
+// Local decoded-first storage (SQLite via sqflite).
 //
 // Durable storage layers:
 //   decoded_onehz — canonical per-second decoded substrate, deduped by rec_ts.
 //   decoded_rr    — sparse RR beats for that substrate, deduped by (rr_ts_ms, beat_index).
 //   samples       — legacy header cache kept only for backward-compat fallback.
 //
-// `counter` (u32 @[3:7]) is still kept as the strap's record id, but analytics
-// read from canonical decoded tables keyed by physiological time so replayed or
-// duplicated historical seconds cannot bloat compute.
+// Raw BLE frames are transient ingest input, not a durable data layer. We store
+// each decoded physiological second once, avoiding a second copy of the same
+// data as packet hex. This keeps local storage bounded and makes the decoded
+// substrate the sole analytics input.
 
 import 'dart:convert';
 import 'dart:io';
@@ -53,7 +54,8 @@ class LocalDb {
         // synchronous/cache_size are per-connection so we set them every open.
         // Durability trade-off under NORMAL: a crash/power-loss can lose only the
         // last uncheckpointed transactions, never corrupt the DB — fine here since
-        // raw is re-syncable from the band and derived is recomputable.
+        // decoded history is re-syncable from the band and derived output is
+        // recomputable.
         //
         // CRITICAL: a perf PRAGMA must NEVER prevent the DB from opening (a throw
         // here fails openDatabase → the app is stuck on the loading screen). And
@@ -97,14 +99,6 @@ class LocalDb {
       },
       onUpgrade: (db, oldV, newV) async {
         if (oldV < 2) await _createEvents(db);
-        if (oldV < 3) {
-          // Re-key raw_records by frame hex so LIVE packets (0x28/0x33) — which
-          // have no per-record counter — can be queued without PK collisions.
-          // Pending unuploaded raw is re-syncable from the band, so a clean
-          // rebuild is acceptable.
-          await db.execute('DROP TABLE IF EXISTS raw_records');
-          await _createRaw(db);
-        }
         if (oldV < 4) {
           // The old samples table cached decoded sensor fields (spo2/skin_temp) that
           // (a) were read from MISIDENTIFIED offsets and (b) nothing ever read. The
@@ -121,43 +115,10 @@ class LocalDb {
           // Purely additive — raw tables are untouched.
           await _createDerived(db);
         }
-        if (oldV < 6) {
-          // BUCKET-BY-REAL-TIME fix. Add `rec_ts` (epoch SECONDS, the decoded
-          // record time) to raw_records and backfill it for every existing row by
-          // decoding the stored hex once. The DerivationEngine now buckets days by
-          // rec_ts (not captured_at), so a multi-day flash backfill received in one
-          // sync no longer collapses into a single "today" bucket. Additive + safe
-          // on a populated DB.
-          await _addRecTsColumn(db);
-          await _backfillRecTs(db);
-          await db.execute(
-            'CREATE INDEX IF NOT EXISTS idx_raw_rects ON raw_records(rec_ts)',
-          );
-        }
         if (oldV < 7) {
           // LOCAL-FIRST user-data layer: journal, menstrual cycle log, workout
           // sessions, and the notifications feed — all on-device, additive.
           await _createUserTables(db);
-        }
-        if (oldV < 8) {
-          // RE-KEY raw_records by `counter` (drop the hex PRIMARY KEY, which
-          // roughly DOUBLED on-disk size) and PURGE the live high-rate bloat
-          // (0x28/0x2B/0x33). CRITICAL: we must NOT drop the 1 Hz historical
-          // substrate (0x2F / R24) — the band will not re-send records its read
-          // cursor has already passed, and they may not be derived yet, so a
-          // blind rebuild would lose real data. Instead: rename aside, create the
-          // new counter-keyed table, migrate the historical rows across (their
-          // counters are unique), and discard only the live frames + the old
-          // hex-PK overhead.
-          await db.execute('ALTER TABLE raw_records RENAME TO _raw_old');
-          await _createRaw(db);
-          await db.execute(
-            'INSERT OR IGNORE INTO raw_records '
-            '(counter, hex, packet_type, captured_at, rec_ts, uploaded) '
-            'SELECT counter, hex, packet_type, captured_at, rec_ts, uploaded '
-            'FROM _raw_old WHERE packet_type = 47 AND counter IS NOT NULL',
-          );
-          await db.execute('DROP TABLE _raw_old');
         }
         if (oldV < 9) {
           // VERSIONED IMMUTABLE DERIVED STORE (ARCHITECTURE_V2 invariant 6).
@@ -166,7 +127,8 @@ class LocalDb {
           // version instead of mutating, and the serve seam reads the latest
           // version per day. Additive: create the new table and best-effort
           // migrate any existing derived_day rows across at the prior version, so
-          // history survives the upgrade (raw is the source of truth regardless).
+          // history survives the upgrade; decoded data remains available for
+          // future derivation.
           await _createDayResult(db);
           try {
             await db.execute(
@@ -191,7 +153,6 @@ class LocalDb {
         }
         if (oldV < 11) {
           await _createDecodedStore(db);
-          await _backfillDecodedStore(db);
           // Live workout steps (Tier-A pedometer over the session's 100 Hz
           // R10 accel). Additive nullable column — old rows read null.
           await db.execute('ALTER TABLE sessions ADD COLUMN steps INTEGER');
@@ -237,8 +198,6 @@ class LocalDb {
         }
         if (oldV < 19) {
           await _createDecodedStore(db);
-          await _backfillDecodedStore(db);
-          await _dropRawStore(db);
           await _ensureSessionSchema(db); // adds hrr_bpm
           await _createWorkoutSuggestions(db);
         }
@@ -268,11 +227,17 @@ class LocalDb {
           // speed was ever recorded for them) — never backfilled/guessed.
           await _ensureWorkoutRouteSpeed(db);
         }
+        if (oldV < 24) {
+          // The old packet replay ledger duplicated every decoded second as hex.
+          // Drop it once during upgrade; all active reads and writes use the
+          // decoded substrate, and a missing historical window can be re-synced.
+          await db.execute('DROP TABLE IF EXISTS raw_records');
+        }
       },
       onOpen: (db) async {
         await _repairOpenSchema(db);
       },
-      version: 23,
+      version: 24,
     );
   }
 
@@ -322,7 +287,6 @@ class LocalDb {
     // Views LAST — they depend on metric_series / day_result / baselines / sessions
     // / notifications all existing. DROP+CREATE so a shape change takes effect.
     await _ensureCoachViews(db);
-    await _dropRawStore(db);
   }
 
   // ── MENSTRUAL SYMPTOM LOG ──────────────────────────────────────────────────
@@ -369,7 +333,7 @@ class LocalDb {
   //   counter_hw       — highest record `counter` we have durably persisted
   //   rec_ts_hw        — highest record `rec_ts` (epoch sec) durably persisted
   //   data_range_lo/hi — strap's own oldest/newest banked record unix (GET_DATA_RANGE)
-  // The "safe-trim invariant" is: persist decoded+raw → persist this cursor →
+  // The "safe-trim invariant" is: persist decoded data → persist this cursor →
   // ACK with-response. The band only trims its flash once the ACK is link-layer
   // confirmed, so a crash anywhere before the ACK re-delivers the batch.
   static Future<void> _createSyncCursor(Database db) async {
@@ -450,8 +414,8 @@ class LocalDb {
   // Device-time windows the live AN-2554 pedometer actually counted (real steps).
   // The 1 Hz estimate excludes any minute that falls inside one of these windows
   // — 100 Hz is the real count and always wins; we never count a minute twice.
-  // Times are device epoch SECONDS (same clock as raw_records.rec_ts, since the
-  // band's RTC is SET_CLOCK'd to phone time on connect). `day` = local date label
+  // Times are device epoch SECONDS (the band's RTC is SET_CLOCK'd to phone time
+  // on connect). `day` = local date label
   // of the window start (for per-day step attribution).
   static Future<void> _createLiveCoverage(Database db) async {
     await db.execute('''
@@ -546,8 +510,8 @@ class LocalDb {
   }
 
   /// Upsert a sync-cursor value. Caller may pass a [txn] so the cursor write
-  /// shares the SAME transaction as the raw batch — keeping "persist raw then
-  /// persist cursor" atomic before the band is ACKed.
+  /// shares the SAME transaction as the decoded batch — keeping "persist data
+  /// then persist cursor" atomic before the band is ACKed.
   static Future<void> setCursor(
     String name,
     String value, {
@@ -561,8 +525,8 @@ class LocalDb {
     }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
-  /// Persist a sync batch atomically: the raw records, their samples, AND the
-  /// continuation cursor in ONE transaction. This is the durable half of the
+  /// Persist a sync batch atomically: decoded records, any undecodable archive,
+  /// and the continuation cursor in one transaction. This is the durable half of the
   /// safe-trim invariant — it MUST return before the engine writes the ACK frame.
   /// Advances counter_hw / rec_ts_hw to the batch max so a restart resumes cleanly.
   ///
@@ -597,7 +561,7 @@ class LocalDb {
       var maxRecTs = await _cursorIntVia(txn, 'rec_ts_hw') ?? 0;
       final batch = txn.batch();
       // SAFE-TRIM INVARIANT: archive the undecodable records in the SAME
-      // transaction as the raw records + trim cursor, so they are durably set
+      // transaction as decoded records + trim cursor, so they are durably set
       // aside BEFORE the caller writes the batch-ACK that lets the band trim.
       if (archives != null) {
         for (final a in archives) {
@@ -650,7 +614,7 @@ class LocalDb {
   // ── DERIVED STORE (permanent, rich) ────────────────────────────────────────
   // The on-device analytics output, keyed by physiological day (wake-to-wake;
   // the `date` label is edge-supplied, display-only). These rows are PERMANENT —
-  // raw is pruned after derivation (rawRetentionDays) but the derived bundle is
+  // decoded substrate is pruned after derivation but the derived bundle is
   // the long-term system of record the UI reads from. See lib/compute/.
   static Future<void> _createDerived(Database db) async {
     // derived_day — one row per physiological day. `payload_json` is the full
@@ -874,10 +838,6 @@ class LocalDb {
     await _ensureSyncQuarantineSchema(db);
   }
 
-  static Future<void> _dropRawStore(Database db) async {
-    await db.execute('DROP TABLE IF EXISTS raw_records');
-  }
-
   static Future<void> _ensureSessionSchema(Database db) async {
     final cols = await db.rawQuery("PRAGMA table_info(sessions)");
     final names = {
@@ -943,7 +903,7 @@ class LocalDb {
   // ── COACH READ-ONLY SQL VIEWS (derived-only) ───────────────────────────────
   // Re-created on every open (DROP+CREATE) so a view-shape change takes effect on
   // upgrade. These flatten DERIVED data only; the coach's read-only SQL layer is
-  // allow-listed to these views and can never reach raw_records / decoded_*.
+  // allow-listed to these views and can never reach ingestion or decoded tables.
   // Every view over day_result selects the LATEST algo_version per day_id.
   static Future<void> _ensureCoachViews(Database db) async {
     const views = [
@@ -1195,10 +1155,9 @@ class LocalDb {
     ''');
   }
 
-  // decoded_onehz / decoded_rr — durable canonical decoded substrate, additive
-  // beside raw_records. This is the canonical query surface for on-device
-  // analytics: one row per real second (`rec_ts`) plus sparse RR beats for that
-  // second. raw_records stays as the replay/debug ledger and upgrade fallback.
+  // decoded_onehz / decoded_rr — durable canonical decoded substrate. This is
+  // the canonical query surface for on-device analytics: one row per real
+  // second (`rec_ts`) plus sparse RR beats for that second.
   static Future<void> _createDecodedStore(Database db) async {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS decoded_onehz (
@@ -1243,8 +1202,7 @@ class LocalDb {
 
   /// Rebuild the decoded substrate into noop-style canonical time-keyed rows:
   /// keep exactly one decoded row per record second and one RR beat per
-  /// (second, beat_index). Older duplicate counters remain in raw_records for
-  /// forensics, but analytics no longer sees them.
+  /// (second, beat_index). Analytics only reads these canonical tables.
   static Future<void> _rebuildCanonicalDecodedStore(Database db) async {
     // Guarantee the source tables exist before we SELECT from them. On upgrade
     // paths from before the decoded store landed, decoded_onehz/decoded_rr were
@@ -1336,65 +1294,6 @@ class LocalDb {
     await db.execute('ALTER TABLE _decoded_rr_new RENAME TO decoded_rr');
   }
 
-  // raw_records — keyed by the band's per-record u32 `counter` (the natural
-  // idempotency key; re-draining the same flash region inserts nothing new). Only
-  // the 1 Hz historical substrate (0x2F / R24) is persisted here — LIVE high-rate
-  // frames are ephemeral (routed to an in-memory sink, never stored). Keying by
-  // counter instead of the full hex string roughly HALVES on-disk size.
-  static Future<void> _createRaw(Database db) async {
-    await db.execute('''
-      CREATE TABLE IF NOT EXISTS raw_records (
-        counter INTEGER PRIMARY KEY,
-        hex TEXT NOT NULL,
-        packet_type INTEGER,
-        captured_at INTEGER NOT NULL,
-        rec_ts INTEGER NOT NULL DEFAULT 0,
-        uploaded INTEGER NOT NULL DEFAULT 0
-      )
-    ''');
-    await db.execute(
-      'CREATE INDEX IF NOT EXISTS idx_raw_unuploaded ON raw_records(uploaded, captured_at) WHERE uploaded = 0',
-    );
-    // rec_ts is the bucketing/window key for the DerivationEngine.
-    await db.execute(
-      'CREATE INDEX IF NOT EXISTS idx_raw_rects ON raw_records(rec_ts)',
-    );
-  }
-
-  /// Add the additive `rec_ts` column to an EXISTING raw_records table (upgrade
-  /// path only). NOT NULL with a DEFAULT 0 so legacy rows are well-formed until
-  /// the backfill rewrites them.
-  static Future<void> _addRecTsColumn(Database db) async {
-    await db.execute(
-      'ALTER TABLE raw_records ADD COLUMN rec_ts INTEGER NOT NULL DEFAULT 0',
-    );
-  }
-
-  /// Backfill `rec_ts` for every existing raw row by decoding its hex once. Runs
-  /// inside the migration on a populated DB. Falls back to captured_at/1000 when a
-  /// frame is undecodable or yields a non-positive ts — rec_ts is never left at 0.
-  static Future<void> _backfillRecTs(Database db) async {
-    final rows = await db.query(
-      'raw_records',
-      columns: ['hex', 'captured_at'],
-      where: 'rec_ts = 0 OR rec_ts IS NULL',
-    );
-    if (rows.isEmpty) return;
-    final batch = db.batch();
-    for (final r in rows) {
-      final hex = r['hex'] as String;
-      final capturedSec = ((r['captured_at'] as int?) ?? 0) ~/ 1000;
-      final ts = decodeRecTs(hex, fallbackSec: capturedSec);
-      batch.update(
-        'raw_records',
-        {'rec_ts': ts},
-        where: 'hex = ?',
-        whereArgs: [hex],
-      );
-    }
-    await batch.commit(noResult: true);
-  }
-
   /// Decode a frame's REAL record timestamp (epoch seconds) from its inner hex.
   /// Cheap (reads the ts field only via the protocol decoders). Returns
   /// [fallbackSec] when undecodable or the decoded ts is non-positive — so callers
@@ -1438,8 +1337,8 @@ class LocalDb {
     }
     payload = {
       ...payload,
-      'latest_raw_rec_ts': latest,
-      'latest_raw_day': _localDayLabelFromEpoch(latest),
+      'latest_decoded_rec_ts': latest,
+      'latest_decoded_day': _localDayLabelFromEpoch(latest),
     };
     await putComputeFreshness('capture', jsonEncode(payload));
   }
@@ -1488,9 +1387,7 @@ class LocalDb {
     // index and decoded_rr a UNIQUE(rr_ts_ms, beat_index). We use REPLACE, not
     // IGNORE: the strap's record `counter` RESETS to ~0 on every reboot, so a
     // post-reboot record whose second already had a row would be SILENTLY DROPPED
-    // under IGNORE — quarantining everything after a reboot (observed: whole days
-    // present in raw_records but absent from the decoded substrate the engine
-    // reads → "not worn / metrics still computing / strain –"). REPLACE lets the
+    // under IGNORE — quarantining everything after a reboot. REPLACE lets the
     // freshly-offloaded record for a given second win, which is what we want.
     //
     // ORPHAN GUARD: decoded_rr rows are keyed by their record's own counter. When
@@ -1528,39 +1425,9 @@ class LocalDb {
     }
   }
 
-  static Future<void> _backfillDecodedStore(Database db) async {
-    const pageSize = 1000;
-    int afterCounter = -1;
-    while (true) {
-      final rows = await db.query(
-        'raw_records',
-        columns: ['counter', 'hex', 'packet_type', 'captured_at', 'rec_ts'],
-        where: 'counter > ? AND packet_type = ?',
-        whereArgs: [afterCounter, 47],
-        orderBy: 'counter ASC',
-        limit: pageSize,
-      );
-      if (rows.isEmpty) return;
-      final batch = db.batch();
-      for (final row in rows) {
-        final raw = RawRecord(
-          counter: (row['counter'] as num?)?.toInt() ?? 0,
-          packetType: (row['packet_type'] as num?)?.toInt() ?? 0,
-          hex: row['hex'] as String,
-          capturedAt: (row['captured_at'] as num?)?.toInt() ?? 0,
-          recTs: (row['rec_ts'] as num?)?.toInt(),
-        );
-        _queueDecodedOneHz(batch, raw, null);
-      }
-      await batch.commit(noResult: true);
-      afterCounter = (rows.last['counter'] as num?)?.toInt() ?? afterCounter;
-      if (rows.length < pageSize) return;
-    }
-  }
-
   // Events (wrist on/off, charging, battery, double-tap, …) — live OR from sync.
   // Keyed by the full frame hex so re-delivered identical events dedupe. Retained
-  // until uploaded, then deleted (same guarantee as raw_records).
+  // until uploaded, then deleted.
   static Future<void> _createEvents(Database db) async {
     await db.execute('''
       CREATE TABLE IF NOT EXISTS events (
@@ -1836,12 +1703,9 @@ class LocalDb {
     );
   }
 
-  /// Store a raw record (+ optional decoded sample). Idempotent on frame hex.
-  /// Raw is written FIRST (raw-first invariant). Returns true if newly inserted.
-  /// LIVE packets pass sample=null — the backend field-decodes them from raw.
   /// Resolve the rec_ts (epoch sec) to store: reuse the already-decoded value from
   /// [raw] (ble_engine sets it from the record it parsed) to avoid a double-decode,
-  /// else decode the hex here, else fall back to captured_at/1000.
+  /// else decode the in-memory frame, then fall back to captured_at/1000.
   static int _recTsFor(RawRecord raw) {
     if (raw.recTs != null && raw.recTs! > 0) return raw.recTs!;
     return decodeRecTs(raw.hex, fallbackSec: raw.capturedAt ~/ 1000);
@@ -1863,7 +1727,7 @@ class LocalDb {
   /// far faster than a transaction-per-record (one fsync instead of thousands).
   /// `samples` is now purely an ingest carrier for decoded fields; rows are
   /// persisted into decoded_onehz/decoded_rr, not into the legacy `samples`
-  /// table. Raw-first is preserved — callers flush this before ACKing a sync batch.
+  /// table. Callers flush this before ACKing a sync batch.
   static Future<void> insertRecordsBatch(
     List<RawRecord> raws,
     List<Sample?> samples,
@@ -2035,7 +1899,6 @@ class LocalDb {
         ) ??
         0;
     return {
-      'raw': oneHz,
       'pending': 0,
       'decoded_onehz': oneHz,
       'decoded_rr': rr,
@@ -2641,9 +2504,8 @@ class LocalDb {
 
   // ── diagnostics (read-only summaries for the Diagnostics screen) ────────────
 
-  /// Raw store summary: total rows, rec_ts span (real record time, sec, >0 only),
-  /// per-packet_type counts, and the captured_at span (ms) for comparison.
-  static Future<Map<String, dynamic>> rawStats() async {
+  /// Decoded-store summary: canonical 1 Hz rows, RR beats, and record-time span.
+  static Future<Map<String, dynamic>> decodedStats() async {
     final db = await instance;
     final count =
         Sqflite.firstIntValue(
@@ -2837,12 +2699,17 @@ class LocalDb {
     final integrity = await db.rawQuery('PRAGMA integrity_check');
     final integrityOk =
         integrity.isNotEmpty && integrity.first.values.first == 'ok';
+    final rawRecordsPresent = await hasTable('raw_records');
 
     return {
-      'ok': missingTables.isEmpty && missingColumns.isEmpty && integrityOk,
+      'ok': missingTables.isEmpty &&
+          missingColumns.isEmpty &&
+          integrityOk &&
+          !rawRecordsPresent,
       'missing_tables': missingTables,
       'missing_columns': missingColumns,
       'integrity_ok': integrityOk,
+      'raw_records_present': rawRecordsPresent,
     };
   }
 
@@ -2903,7 +2770,7 @@ class LocalDb {
     int limit,
   ) async {
     final rows = await recentDayResults(limit);
-    final rawByDay = await decodedRecTsMaxByDay();
+    final decodedByDay = await decodedRecTsMaxByDay();
     final out = <Map<String, dynamic>>[];
     for (final row in rows) {
       final payload = row['payload_json'] as String?;
@@ -2924,7 +2791,7 @@ class LocalDb {
         'computed_at': row['computed_at'],
         'algo_version': row['algo_version'],
         'finalized': row['finalized'],
-        'raw_max_rec_ts': rawByDay[dayId],
+        'decoded_max_rec_ts': decodedByDay[dayId],
         'skipped': decoded['skipped'] == true,
         'skip_reason': decoded['reason'],
         'rhr': row['rhr'] ?? scalars['rhr'],
@@ -3061,12 +2928,12 @@ class LocalDb {
   static String localDayLabelNow() => todayLabel();
 
   static Future<void> refreshComputeFreshness() async {
-    final raw = await rawStats();
+    final decodedStats = await LocalDb.decodedStats();
     final recent = await recentDayResults(30);
     final rolling = await baseline('rolling');
     final cross = await baseline('crossday');
     final today = localDayLabelNow();
-    final latestRawTs = (raw['max_rec_ts'] as num?)?.toInt();
+    final latestDecodedTs = (decodedStats['max_rec_ts'] as num?)?.toInt();
     final todayWake = await wakeDayFeatures(today);
     String? latestOvernightDay;
     int? latestOvernightComputedAt;
@@ -3116,23 +2983,23 @@ class LocalDb {
     final wakeComputedAt = (todayWake?['computed_at'] as num?)?.toInt();
     final activityReady = todayRow != null || todayWake != null;
     final overnightReady = latestOvernightDay == today;
-    final rawReachedToday =
-        latestRawTs != null && _localDayLabelFromEpoch(latestRawTs) == today;
+    final decodedReachedToday =
+        latestDecodedTs != null && _localDayLabelFromEpoch(latestDecodedTs) == today;
     final activityState = activityReady
         ? 'ready'
-        : (rawReachedToday ? 'building' : 'missing');
+        : (decodedReachedToday ? 'building' : 'missing');
     final overnightState = overnightReady
         ? 'ready'
-        : (rawReachedToday ? 'building' : 'missing');
+        : (decodedReachedToday ? 'building' : 'missing');
     await putComputeFreshness(
       'capture',
       jsonEncode({
-        'latest_raw_rec_ts': latestRawTs,
-        'latest_raw_day': latestRawTs == null
+        'latest_decoded_rec_ts': latestDecodedTs,
+        'latest_decoded_day': latestDecodedTs == null
             ? null
-            : _localDayLabelFromEpoch(latestRawTs),
-        'decoded_onehz': raw['decoded_onehz'],
-        'decoded_rr': raw['decoded_rr'],
+            : _localDayLabelFromEpoch(latestDecodedTs),
+        'decoded_onehz': decodedStats['decoded_onehz'],
+        'decoded_rr': decodedStats['decoded_rr'],
       }),
     );
     await putComputeFreshness(

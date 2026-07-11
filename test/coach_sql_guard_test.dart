@@ -26,7 +26,6 @@ void main() {
     });
 
     for (final bad in <String>[
-      'SELECT * FROM raw_records',
       'SELECT * FROM decoded_onehz',
       'SELECT * FROM decoded_rr',
       'SELECT * FROM day_result',

@@ -453,7 +453,7 @@ class _TodayScreenState extends State<TodayScreen>
   ///   • decoded data collected, not yet derived → invite to analyze now.
   ///   • truly no data      → "Wear + sync to see today".
   Widget _emptyOrProcessing(AppState app) {
-    final raw = app.dbCounts['decoded_onehz'] ?? app.dbCounts['raw'] ?? 0;
+    final raw = app.dbCounts['decoded_onehz'] ?? 0;
     if (app.reanalyzing) {
       return SurfaceCard(
         padding: const EdgeInsets.all(Sp.x6),

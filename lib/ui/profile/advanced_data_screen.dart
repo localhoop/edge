@@ -206,11 +206,11 @@ class _AdvancedDataScreenState extends State<AdvancedDataScreen> {
                 children: [
                   _kv(
                     'Latest data day',
-                    _capture?['latest_raw_day']?.toString() ?? '—',
+                    _capture?['latest_decoded_day']?.toString() ?? '—',
                   ),
                   _kv(
                     'Latest data rec_ts',
-                    (_capture?['latest_raw_rec_ts'] ?? '—').toString(),
+                    (_capture?['latest_decoded_rec_ts'] ?? '—').toString(),
                   ),
                   _kv(
                     'Decoded 1 Hz rows',

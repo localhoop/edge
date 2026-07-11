@@ -169,8 +169,8 @@ bool burstPacketCountMatches({
     expectedPacketCount == actualBurstPacketCount + droppedThisBurst;
 
 /// Fired for every LIVE high-rate frame (0x28/0x2B/0x33). These are EPHEMERAL —
-/// they are NOT persisted to raw_records (that bloated storage ~50x and stalled
-/// derivation). The caller routes them to an in-memory sink for the live UI /
+/// they are not persisted (that bloated storage ~50x and stalled derivation).
+/// The caller routes them to an in-memory sink for the live UI /
 /// spot-check / workout feature-extraction. `recTs` is the frame's decoded real
 /// device time (epoch sec), or null if undecodable.
 typedef LiveFrameSink = void Function(int packetType, String hex, int? recTs);
@@ -344,7 +344,7 @@ class BleEngine {
 
   /// If provided, LIVE high-rate frames (0x28/0x2B/0x33) are routed here instead
   /// of being persisted. Ephemeral — for the live UI / spot-check / workout
-  /// feature-extraction. NEVER hits raw_records.
+  /// feature-extraction. Never persisted.
   final LiveFrameSink? onLiveFrame;
   final OffloadStateSink? onOffloadState;
 
@@ -1135,7 +1135,7 @@ class BleEngine {
       // SINGLE LISTENING MODE. Arm the offload controller, enter `listening`, then
       // fire INIT — which triggers the historical flood. Historical + live records
       // then arrive on the same subscription; HISTORY_END markers are committed
-      // (raw+samples+cursor, atomically) BEFORE we ACK, so the offload is resumable.
+      // (decoded data+cursor, atomically) BEFORE we ACK, so the offload is resumable.
       _drain = _DrainController(
         onRecord: _storeRecord,
         onRecordsBatch: onRecordsBatch == null ? null : _storeRecordsBatch,
@@ -1562,7 +1562,7 @@ class BleEngine {
     // LIVE streams: realtime HR/RR (0x28), realtime R10 (0x2B), IMU (0x33).
     // EPHEMERAL — these are the high-rate flood (~655 MB/day) and the daily
     // metrics need ONLY the 1 Hz historical substrate (0x2F / R24). We do NOT
-    // persist them to raw_records; instead we route them to the in-memory live
+    // persist them; instead we route them to the in-memory live
     // sink (live UI / spot-check / workout feature-extraction). We also do NOT
     // arm the derive debounce (nothing was stored). Never touch the
     // historical-sync bookkeeping (which keys off 0x2F only).
@@ -1713,8 +1713,7 @@ class BleEngine {
     }
     // FIRMWARE RESILIENCE: a historical record we could NOT decode (unknown/
     // unsupported version, or a known version whose decode failed) is ARCHIVED
-    // durably rather than dropped — it used to fall into raw_records with a null
-    // rec_ts and get pruned unseen, losing a future firmware's data forever. The
+    // durably rather than dropped, preserving a future firmware's data. The
     // archive rides the SAME commit that runs before the batch-ACK, so nothing the
     // band trims has been discarded (safe-trim invariant intact).
     if (sample == null) {
@@ -1756,7 +1755,7 @@ class BleEngine {
       recTs: sample.tsEpoch > 0 ? sample.tsEpoch : null,
     );
     // Hand the record to the offload controller (it buffers per-batch until the
-    // HISTORY_END flush, which persists raw-first BEFORE we ACK). The controller
+    // HISTORY_END flush, which persists decoded data BEFORE we ACK). The controller
     // is armed for the whole connection, so this is always present; the fallback
     // just stores directly if a frame somehow arrives before setup completed.
     final d = _drain;
@@ -2744,7 +2743,7 @@ class BleEngine {
 }
 
 /// Per-connection historical-offload helper. Buffers records per ACK boundary and
-/// flushes them in one transaction (raw-first, BEFORE the HISTORY_END ACK). It is
+/// flushes them in one transaction (decoded data first, BEFORE the HISTORY_END ACK). It is
 /// armed for the whole connection (single listening mode). It tracks running counts
 /// and exposes an
 /// [awaitComplete] future that resolves when the band signals HISTORY_COMPLETE (or

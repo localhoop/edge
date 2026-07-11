@@ -135,10 +135,8 @@ import 'substrate.dart';
 // and silently quarantined every post-reboot day (empty "today", strain –). The
 // DB v17 migration (_rebuildCanonicalDecodedStore) rebuilt decoded_onehz/
 // decoded_rr time-keyed, the write path REPLACEs on rec_ts, and the substrate
-// loader falls back to decoding raw_records directly for ranges whose decoded
-// rows are absent — so previously-quarantined days now have data. Bump so those
-// days (and any finalized day derived while data was missing) recompute against
-// the recovered substrate.
+// loader reads only the canonical decoded substrate. Bump so days derived with
+// the earlier incomplete store recompute against the recovered data.
 // v32: SLEEP-STAGE fix — the REM detector depended on a respiration signal
 // (`resp`) that no real caller ever supplied (WHOOP 4's R24 record has no
 // respiration-ADC channel), so it was unconditionally NaN and the primary
@@ -182,8 +180,8 @@ import 'substrate.dart';
 // accurate) staging recomputes; "Re-analyze data" needed for finalized nights.
 const int kAlgoVersion = 37;
 
-/// Raw is kept this many days past derivation, then pruned (derived stays).
-const int rawRetentionDays = 3;
+/// Decoded substrate is kept this many days past derivation (derived stays).
+const int decodedRetentionDays = 3;
 
 /// A day stays recomputable for this long after its wake, then FINALIZES (locks)
 /// — more flash may still drain within this buffer (ARCHITECTURE_V2: ~48 h).
@@ -1865,15 +1863,15 @@ class DerivationEngine {
     await _refreshCrossDayInputArtifact();
   }
 
-  // ── raw pruning (raw-first invariant) ──────────────────────────────────────
+  // ── decoded-substrate pruning ───────────────────────────────────────────────
 
-  /// Prune raw older than [rawRetentionDays] BEHIND THE DATA EDGE. Retention is
+  /// Prune decoded data older than [decodedRetentionDays] BEHIND THE DATA EDGE. Retention is
   /// measured against the last record timestamp we actually drained
   /// ([dataNowSec]), never the wall clock, and rows are deleted by their record
   /// time (`rec_ts`), never receive time (`captured_at`) — a multi-day flash
   /// backfill received in one sync must not be pruned just because it landed
   /// "now". Guard: never prune while any day in [days] is NOT yet derived at the
-  /// current algo version (raw-first).
+  /// current algo version.
   Future<void> _pruneOldDecoded(List<String> dayIds, int dataNowSec) async {
     final derivedIds = await LocalDb.dayResultIds(kAlgoVersion);
     final pending = dayIds.where((d) => !derivedIds.contains(d)).toList();
@@ -1881,7 +1879,7 @@ class DerivationEngine {
       _log('prune skipped — ${pending.length} day(s) not yet derived');
       return;
     }
-    final cutoffSec = dataNowSec - rawRetentionDays * 86400;
+    final cutoffSec = dataNowSec - decodedRetentionDays * 86400;
     if (cutoffSec <= 0) return;
     final deleted = await LocalDb.pruneDecodedBeforeRecTs(cutoffSec);
     if (deleted > 0) {

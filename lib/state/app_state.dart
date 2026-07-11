@@ -1,8 +1,8 @@
 // AppState — the single ChangeNotifier the UI listens to. Orchestrates the BLE
-// engine, local DB writes (raw-first), live telemetry, and the screen data SEAM.
+// engine, decoded local DB writes, live telemetry, and the screen data SEAM.
 //
 // CLOUD EXCISED: there is no backend, no auth, no upload. Records are captured
-// locally (raw_records / samples / events in lib/data/db.dart) and that is the
+// locally (decoded substrate / samples / events in lib/data/db.dart) and that is the
 // system of record. Screens read through `repo` (a LocalRepository — the seam to
 // the future on-device analytics re-layer); they no longer talk to a server.
 //
@@ -2137,7 +2137,7 @@ class AppState extends ChangeNotifier {
     // The foreground guard stops a wake from fighting this live session for the band.
     IosBleRestore.foregroundActive = true;
     IosBleRestore.arm(paired!.remoteId);
-    _log('===== SESSION START ===== raw=${dbCounts['raw']}');
+    _log('===== SESSION START ===== decoded=${dbCounts['decoded_onehz']}');
     try {
       await _ensureForegroundLease();
       // connect() now subscribes → SET_CLOCK → INIT, so the historical offload is

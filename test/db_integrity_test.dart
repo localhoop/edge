@@ -60,6 +60,37 @@ void main() {
   test('fresh schema passes schemaHealth (migration smoke)', () async {
     final health = await LocalDb.schemaHealth();
     expect(health['ok'], isTrue, reason: '$health');
+    expect(health['raw_records_present'], isFalse);
+  });
+
+  test('v24 upgrade drops the obsolete raw_records ledger', () async {
+    const legacyName = 'openstrap_raw_records_v23_test.db';
+    final originalName = LocalDb.dbName;
+    final dir = await databaseFactory.getDatabasesPath();
+    final legacyPath = p.join(dir, legacyName);
+    await LocalDb.close();
+    await databaseFactory.deleteDatabase(legacyPath);
+    final legacy = await databaseFactory.openDatabase(legacyPath);
+    await legacy.execute('''
+      CREATE TABLE raw_records (
+        counter INTEGER PRIMARY KEY,
+        hex TEXT NOT NULL,
+        captured_at INTEGER NOT NULL
+      )
+    ''');
+    await legacy.execute('PRAGMA user_version = 23');
+    await legacy.close();
+
+    LocalDb.dbName = legacyName;
+    final migrated = await LocalDb.instance;
+    final rawTable = await migrated.rawQuery(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'raw_records'",
+    );
+    expect(rawTable, isEmpty);
+
+    await LocalDb.close();
+    LocalDb.dbName = originalName;
+    await databaseFactory.deleteDatabase(legacyPath);
   });
 
   test('rec_ts collision leaves no orphaned decoded_rr beats', () async {

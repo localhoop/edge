@@ -68,8 +68,8 @@ class Sample {
   );
 }
 
-/// A raw historical record exactly as it came off the band — the source of truth.
-/// We keep this even when decode succeeds so the cloud can re-decode opaque bytes.
+/// A historical record as it came off the band during ingestion.
+/// Successful records are persisted as decoded rows, not duplicate packet hex.
 class RawRecord {
   final int
   counter; // u32 @[3:7] for header records; 0 for counter-less live packets

@@ -52,7 +52,7 @@ class CoachDb {
 
   // Base/raw table names that must NOT appear anywhere (force the views).
   static const Set<String> _denyTables = {
-    'raw_records', 'decoded_onehz', 'decoded_rr', 'samples', 'sqlite_master',
+    'decoded_onehz', 'decoded_rr', 'samples', 'sqlite_master',
     'day_result', 'metric_series', 'baselines', 'sessions', 'notifications',
     'derived_day', 'events', 'band_events', 'band_battery', 'live_coverage',
     'sync_ledger', 'sync_quarantine', 'sync_cursor', 'compute_jobs',

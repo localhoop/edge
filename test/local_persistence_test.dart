@@ -167,7 +167,7 @@ void main() {
       final recent = await LocalDb.recentDayDiagnostics(1);
       expect(recent, isNotEmpty);
       expect(recent.first['day_id'], dayId);
-      expect(recent.first['raw_max_rec_ts'], rawTs);
+      expect(recent.first['decoded_max_rec_ts'], rawTs);
       expect(recent.first['rhr'], 52.0);
       expect(recent.first['readiness'], 87.0);
       expect(recent.first['strain'], 11.3);
@@ -255,7 +255,7 @@ void main() {
       expect(ranged, hasLength(1));
       expect(ranged.first.counter, 424242);
 
-      final stats = await LocalDb.rawStats();
+      final stats = await LocalDb.decodedStats();
       expect(stats['decoded_onehz'], greaterThanOrEqualTo(1));
       expect(stats['decoded_rr'], greaterThanOrEqualTo(2));
     },
@@ -416,7 +416,7 @@ void main() {
         trimToken: 'aa00bb11cc22dd33',
       );
       final counts = await LocalDb.counts();
-      expect(counts['raw'], greaterThanOrEqualTo(2));
+      expect(counts['decoded_onehz'], greaterThanOrEqualTo(2));
       expect(await LocalDb.getCursorInt('counter_hw'), 11);
       expect(await LocalDb.getCursorInt('rec_ts_hw'), 1750000200);
       expect(await LocalDb.getCursor('strap_trim'), 'aa00bb11cc22dd33');

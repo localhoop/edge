@@ -61,8 +61,8 @@ void main() {
     expect(decoded['row_count'], 1);
     expect((decoded['rows'] as List).first['value'], 55.0);
 
-    // Raw access is rejected with a self-correct reason, not rows.
-    final bad = await CoachDb.runCoachSql('SELECT * FROM raw_records');
+    // Decoded-store access is rejected with a self-correct reason, not rows.
+    final bad = await CoachDb.runCoachSql('SELECT * FROM decoded_onehz');
     final badDec = jsonDecode(bad) as Map<String, dynamic>;
     expect(badDec.containsKey('error'), isTrue);
   });
